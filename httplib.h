@@ -12999,20 +12999,74 @@ inline bool ClientImpl::redirect(Request &req, Response &res, Error &error) {
   auto location = res.get_header_value("location");
   if (location.empty()) { return false; }
 
-  thread_local const std::regex re(
-      R"((?:(https?):)?(?://(?:\[([a-fA-F\d:]+)\]|([^:/?#]+))(?::(\d+))?)?([^?#]*)(\?[^#]*)?(?:#.*)?)");
+  // Parse Location URL without regex to avoid stack overflow on long URLs
+  // (e.g., S3 presigned URLs can be 2KB+, and std::regex uses recursive
+  // backtracking that can overflow the stack, especially on Alpine/musl)
+  std::string next_scheme, next_host, port_str, next_path, next_query;
+  size_t pos = 0;
 
-  std::smatch m;
-  if (!std::regex_match(location, m, re)) { return false; }
+  // Parse scheme (e.g., "https://")
+  size_t scheme_end = location.find("://");
+  if (scheme_end != std::string::npos) {
+    next_scheme = location.substr(0, scheme_end);
+    pos = scheme_end + 3;
+  }
+
+  // Parse host
+  if (pos < location.size()) {
+    if (location[pos] == '[') {
+      // IPv6 address [...]
+      size_t bracket_end = location.find(']', pos);
+      if (bracket_end != std::string::npos) {
+        next_host = location.substr(pos + 1, bracket_end - pos - 1);
+        pos = bracket_end + 1;
+      } else {
+        // Malformed IPv6 address
+        return false;
+      }
+    } else {
+      // Regular hostname
+      size_t host_end = location.find_first_of(":/?#", pos);
+      if (host_end == std::string::npos) host_end = location.size();
+      next_host = location.substr(pos, host_end - pos);
+      pos = host_end;
+    }
+  }
+
+  // Parse port
+  if (pos < location.size() && location[pos] == ':') {
+    pos++;
+    size_t port_end = location.find_first_of("/?#", pos);
+    if (port_end == std::string::npos) port_end = location.size();
+    port_str = location.substr(pos, port_end - pos);
+    pos = port_end;
+  }
+
+  // Parse path and query
+  if (pos < location.size()) {
+    // Find query string start
+    size_t query_start = location.find('?', pos);
+    // Find fragment start (we discard fragments)
+    size_t fragment_start = location.find('#', pos);
+
+    size_t path_end = location.size();
+    if (query_start != std::string::npos && (fragment_start == std::string::npos || query_start < fragment_start)) {
+      path_end = query_start;
+    } else if (fragment_start != std::string::npos) {
+      path_end = fragment_start;
+    }
+
+    next_path = location.substr(pos, path_end - pos);
+
+    if (query_start != std::string::npos && (fragment_start == std::string::npos || query_start < fragment_start)) {
+      size_t query_end = (fragment_start != std::string::npos && fragment_start > query_start)
+                             ? fragment_start
+                             : location.size();
+      next_query = location.substr(query_start, query_end - query_start);
+    }
+  }
 
   auto scheme = is_ssl() ? "https" : "http";
-
-  auto next_scheme = m[1].str();
-  auto next_host = m[2].str();
-  if (next_host.empty()) { next_host = m[3].str(); }
-  auto port_str = m[4].str();
-  auto next_path = m[5].str();
-  auto next_query = m[6].str();
 
   auto next_port = port_;
   if (!port_str.empty()) {
